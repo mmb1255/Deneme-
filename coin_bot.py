@@ -157,6 +157,9 @@ async def ask_claude(client, snapshot):
 
 # ---------------------------------------------------------------- döngü
 
+if os.name == "nt":
+    os.system("")  # Windows konsolunda ANSI renklerini etkinleştir
+
 COLORS = {"LONG": "\033[92m", "SHORT": "\033[91m", "BEKLE": "\033[93m"}
 RESET = "\033[0m"
 

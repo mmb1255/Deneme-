@@ -6,9 +6,17 @@ Claude'a **LONG / SHORT / BEKLE** diye sorar. Sonuçlar ekrana ve `sinyaller.csv
 
 ## Kurulum
 
+Linux / macOS:
 ```bash
 pip install -r requirements.txt
-export ANTHROPIC_API_KEY=sk-ant-...      # Windows: set ANTHROPIC_API_KEY=sk-ant-...
+export ANTHROPIC_API_KEY=sk-ant-...
+python coin_bot.py
+```
+
+Windows PowerShell (proje klasörünün içindeyken):
+```powershell
+pip install -r requirements.txt
+$env:ANTHROPIC_API_KEY = "sk-ant-..."
 python coin_bot.py
 ```
 
