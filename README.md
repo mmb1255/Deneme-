@@ -14,12 +14,24 @@ istatistik paneli ve **net R bazında** zaman dilimi karşılaştırması ekler.
 
 | Bölüm | İçerik |
 |---|---|
-| Piyasa durumu | Anlık trend (EMA 21/99/200 dizilimi + ADX gücü), 1S ve 4S üst zaman trendi, RSI / StochK / KDJ-J değerleri, aktif işlem ve anlık R'si, son sinyalin kaç bar önce geldiği |
+| Piyasa durumu | Anlık trend (EMA 21/99/200 dizilimi + ADX gücü), 1S ve 4S üst zaman trendi, RSI / StochK / KDJ-J değerleri, aktif işlem ve anlık R'si, son sinyalin kaç bar önce geldiği, **son kapanan işlemin sonucu ve süresi**, kazanan / kaybeden işlemlerin ortalama süresi |
 | Performans | TP1 oranı, TP2 tam hedef oranı, net R, işlem başına ortalama R, kâr faktörü, maksimum düşüş (R), maksimum ardışık kayıp, **LONG ve SHORT için ayrı** TP1 oranı ve net R |
 | Zaman dilimi | 5 dk / 15 dk / 1 saat / 4 saat için net R, TP1 oranı ve işlem sayısı; **en iyi periyot net R'ye göre** seçilir (min. işlem sayısı ayarlanabilir) |
 
 Ayrıca LONG ve SHORT sinyalleri için `alertcondition` tanımlı; TradingView alarm
 menüsünden seçilebilir.
+
+## Grafikteki sonuç etiketleri
+
+İşlem kapandığında bar üzerine bir etiket çizilir:
+
+- `🎯 TP2 · +1.6 R · 95 dk (1s 35dk)` → tam hedef vuruldu
+- `✔ TP1 · stop BE · 40 dk` → TP1 vuruldu, stop girişe çekildi, işlem sürüyor
+- `↩ BE ÇIKIŞ · +0.5 R · 70 dk` → TP1 sonrası kalan yarı girişten çıktı
+- `❌ STOP · -1.0 R · 15 dk` → stop oldu
+
+Süre, giriş barının kapanışından çıkış barının kapanışına kadar geçen zamandır ve dakika cinsindendir.
+Bar içinde tam olarak hangi dakikada vurulduğu bilinemez; hassasiyet grafik periyodu kadardır.
 
 ## R hesabı
 

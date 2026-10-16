@@ -16,6 +16,7 @@ grp_vis = "Görsel"
 show_fvg      = input.bool(true, "FVG Göster", group=grp_vis)
 show_liq      = input.bool(true, "Likidite Göster", group=grp_vis)
 liq_pivot_len = input.int(10, "Likidite Hassasiyeti", minval=4, maxval=30, group=grp_vis)
+show_res_lbl  = input.bool(true, "Sonuç Etiketleri (TP / STOP / Süre)", group=grp_vis)
 
 grp_pnl = "Panel"
 show_panel    = input.bool(true, "Paneli Göster", group=grp_pnl)
@@ -43,6 +44,12 @@ f_dir_txt(int d) =>
 
 f_dir_col(int d) =>
     d == 1 ? color.lime : d == -1 ? color.red : color.gray
+
+f_dur_txt(int ms) =>
+    _m = math.max(math.round(ms / 60000.0), 0)
+    _h = math.floor(_m / 60)
+    _k = _m - _h * 60
+    str.tostring(_m) + " dk" + (_m >= 60 ? " (" + str.tostring(_h) + "s " + str.tostring(_k) + "dk)" : "")
 
 f_tf_row(float r, float wr, int cnt) =>
     cnt > 0 ? f_r_txt(r) + " · %" + str.tostring(wr, "0") + " TP1 (" + str.tostring(cnt) + " işl.)" : "İşlem yok"
@@ -305,6 +312,13 @@ var int cur_loss_streak = 0
 var int max_loss_streak = 0
 var int last_signal_bar = na
 var int last_signal_dir = 0
+var int entry_t         = 0
+var int win_dur_sum     = 0
+var int loss_dur_sum    = 0
+var int win_dur_n       = 0
+var int loss_dur_n      = 0
+var string last_res_txt = "—"
+var color  last_res_col = color.gray
 
 var int active_dir    = 0
 var float entry_p     = 0.0
@@ -322,6 +336,10 @@ var line l_tp2 = na
 // ------------------------------------------------------------
 //  AÇIK POZİSYON TAKİBİ
 // ------------------------------------------------------------
+int   close_kind = 0      // 0: yok, 1: STOP, 2: TP2, 3: BE çıkış (TP1 sonrası)
+bool  tp1_now    = false
+int   closed_dir = 0
+float closed_r   = 0.0
 if active_dir == 1
     line.set_x2(l_ent, bar_index)
     line.set_x2(l_sl, bar_index)
@@ -337,16 +355,23 @@ if active_dir == 1
             cur_loss_streak += 1
             max_loss_streak := math.max(max_loss_streak, cur_loss_streak)
             active_dir      := 0
+            close_kind      := 1
+            closed_dir      := 1
+            closed_r        := -1.0
         else if high >= tp1_p
             tp1_hit         := true
             long_tp1_w      += 1
             cur_loss_streak := 0
+            tp1_now         := true
             if high >= tp2_p
                 tp2_full_wins += 1
                 long_tp2_w    += 1
                 total_net_r   += full_win_r
                 long_net_r    += full_win_r
                 active_dir    := 0
+                close_kind    := 2
+                closed_dir    := 1
+                closed_r      := full_win_r
     else
         if high >= tp2_p
             tp2_full_wins += 1
@@ -354,11 +379,17 @@ if active_dir == 1
             total_net_r   += full_win_r
             long_net_r    += full_win_r
             active_dir    := 0
+            close_kind    := 2
+            closed_dir    := 1
+            closed_r      := full_win_r
         else if low <= entry_p
             tp1_only_wins += 1
             total_net_r   += half_win_r
             long_net_r    += half_win_r
             active_dir    := 0
+            close_kind    := 3
+            closed_dir    := 1
+            closed_r      := half_win_r
 
 else if active_dir == -1
     line.set_x2(l_ent, bar_index)
@@ -375,16 +406,23 @@ else if active_dir == -1
             cur_loss_streak += 1
             max_loss_streak := math.max(max_loss_streak, cur_loss_streak)
             active_dir      := 0
+            close_kind      := 1
+            closed_dir      := -1
+            closed_r        := -1.0
         else if low <= tp1_p
             tp1_hit         := true
             short_tp1_w     += 1
             cur_loss_streak := 0
+            tp1_now         := true
             if low <= tp2_p
                 tp2_full_wins += 1
                 short_tp2_w   += 1
                 total_net_r   += full_win_r
                 short_net_r   += full_win_r
                 active_dir    := 0
+                close_kind    := 2
+                closed_dir    := -1
+                closed_r      := full_win_r
     else
         if low <= tp2_p
             tp2_full_wins += 1
@@ -392,11 +430,54 @@ else if active_dir == -1
             total_net_r   += full_win_r
             short_net_r   += full_win_r
             active_dir    := 0
+            close_kind    := 2
+            closed_dir    := -1
+            closed_r      := full_win_r
         else if high >= entry_p
             tp1_only_wins += 1
             total_net_r   += half_win_r
             short_net_r   += half_win_r
             active_dir    := 0
+            close_kind    := 3
+            closed_dir    := -1
+            closed_r      := half_win_r
+
+// ------------------------------------------------------------
+//  SONUÇ ETİKETLERİ & SÜRE İSTATİSTİĞİ
+// ------------------------------------------------------------
+trade_dur_ms = time_close - entry_t
+
+// TP1 vuruldu ama işlem devam ediyor (stop girişe çekildi)
+if tp1_now and close_kind == 0 and show_res_lbl
+    _d = active_dir == 1
+    label.new(bar_index, _d ? high : low, "✔ TP1 · stop BE · " + f_dur_txt(trade_dur_ms), color=color.new(color.teal, 20), textcolor=color.white, style=_d ? label.style_label_down : label.style_label_up, size=size.tiny)
+
+if close_kind != 0
+    _is_win  = close_kind != 1
+    _dur_txt = f_dur_txt(trade_dur_ms)
+    _res     = close_kind == 1 ? "❌ STOP" : close_kind == 2 ? "🎯 TP2" : "↩ BE ÇIKIŞ"
+    _txt     = _res + " · " + f_r_txt(closed_r) + " · " + _dur_txt
+    _col     = close_kind == 1 ? color.red : close_kind == 2 ? color.green : color.new(color.orange, 20)
+    _side    = closed_dir == 1 ? "LONG" : "SHORT"
+
+    if _is_win
+        win_dur_sum += trade_dur_ms
+        win_dur_n   += 1
+    else
+        loss_dur_sum += trade_dur_ms
+        loss_dur_n   += 1
+
+    last_res_txt := _side + " " + _txt
+    last_res_col := _col
+
+    if show_res_lbl
+        // Kazanç etiketi fiyatın gittiği tarafta, stop etiketi ters tarafta
+        _above = (closed_dir == 1) == _is_win
+        label.new(bar_index, _above ? high : low, _txt, color=_col, textcolor=color.white, style=_above ? label.style_label_down : label.style_label_up, size=size.small)
+        line.set_color(l_ent, color.new(color.yellow, 60))
+        line.set_color(l_sl,  color.new(color.red, 60))
+        line.set_color(l_tp1, color.new(color.teal, 60))
+        line.set_color(l_tp2, color.new(color.lime, 60))
 
 // Maksimum düşüş (R bazında, kapanan işlemler üzerinden)
 peak_r   := math.max(peak_r, total_net_r)
@@ -432,6 +513,7 @@ if new_long
     tp1_hit         := false
     last_signal_bar := bar_index
     last_signal_dir := 1
+    entry_t         := time_close
 
     label.new(bar_index, low, "🚀 LONG | TP1: %" + str.tostring(prob_tp1_l, "#"), color=color.green, textcolor=color.white, style=label.style_label_up, size=size.small)
     l_ent  := line.new(bar_index, entry_p, bar_index + 5, entry_p, color=color.yellow, width=2)
@@ -455,6 +537,7 @@ if new_short
     tp1_hit         := false
     last_signal_bar := bar_index
     last_signal_dir := -1
+    entry_t         := time_close
 
     label.new(bar_index, high, "🩸 SHORT | TP1: %" + str.tostring(prob_tp1_s, "#"), color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small)
     l_ent  := line.new(bar_index, entry_p, bar_index + 5, entry_p, color=color.yellow, width=2)
@@ -478,7 +561,7 @@ alertcondition(new_short, title="KM SHORT Sinyali", message="KM PRO V5: SHORT si
 // ============================================================
 panel_pos = panel_pos_in == "Sağ Üst" ? position.top_right : panel_pos_in == "Sağ Alt" ? position.bottom_right : panel_pos_in == "Sol Üst" ? position.top_left : position.bottom_left
 
-var table stat_tbl = show_panel ? table.new(panel_pos, columns=2, rows=22, bgcolor=color.new(color.black, 10), border_color=color.gray, border_width=1) : na
+var table stat_tbl = show_panel ? table.new(panel_pos, columns=2, rows=24, bgcolor=color.new(color.black, 10), border_color=color.gray, border_width=1) : na
 
 c_head = color.navy
 c_sec  = color.new(color.teal, 55)
@@ -512,6 +595,10 @@ if show_panel and barstate.islast
         unreal_r = active_dir == 1 ? (close - entry_p) / risk_p : (entry_p - close) / risk_p
         act_txt := (active_dir == 1 ? "LONG" : "SHORT") + " @ " + str.tostring(entry_p, format.mintick) + " · " + f_r_txt(unreal_r) + (tp1_hit ? " · TP1 ✔ (BE)" : "")
         act_col := unreal_r >= 0 ? color.lime : color.red
+
+    avg_win_dur  = win_dur_n  > 0 ? f_dur_txt(math.round(win_dur_sum  / win_dur_n))  : "—"
+    avg_loss_dur = loss_dur_n > 0 ? f_dur_txt(math.round(loss_dur_sum / loss_dur_n)) : "—"
+    avg_dur_txt  = avg_win_dur + " / " + avg_loss_dur
 
     last_sig_txt = na(last_signal_bar) ? "—" : str.tostring(bar_index - last_signal_bar) + " bar önce (" + (last_signal_dir == 1 ? "LONG" : "SHORT") + ")"
 
@@ -560,52 +647,58 @@ if show_panel and barstate.islast
     table.cell(stat_tbl, 0, 5, "🕒 Son Sinyal", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
     table.cell(stat_tbl, 1, 5, last_sig_txt, text_color=color.white, text_size=size.tiny)
 
+    table.cell(stat_tbl, 0, 6, "🏁 Son Kapanan İşlem", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 6, last_res_txt, text_color=last_res_col, text_size=size.tiny)
+
+    table.cell(stat_tbl, 0, 7, "⏳ Ort. Süre (Kazanç / Kayıp)", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 7, avg_dur_txt, text_color=color.white, text_size=size.tiny)
+
     // ---- Performans ----
-    table.cell(stat_tbl, 0, 6, "PERFORMANS (" + timeframe.period + " grafik)", text_color=color.white, text_size=size.tiny, bgcolor=c_sec, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 6, "", bgcolor=c_sec)
+    table.cell(stat_tbl, 0, 8, "PERFORMANS (" + timeframe.period + " grafik)", text_color=color.white, text_size=size.tiny, bgcolor=c_sec, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 8, "", bgcolor=c_sec)
 
-    table.cell(stat_tbl, 0, 7, "✔ TP1 Vurma Oranı", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 7, "%" + str.tostring(tp1_wr, "0.0") + " (" + str.tostring(total_tp1_wins) + "W / " + str.tostring(sl_losses) + "L)", text_color=wr1_col, text_size=size.small)
+    table.cell(stat_tbl, 0, 9, "✔ TP1 Vurma Oranı", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 9, "%" + str.tostring(tp1_wr, "0.0") + " (" + str.tostring(total_tp1_wins) + "W / " + str.tostring(sl_losses) + "L)", text_color=wr1_col, text_size=size.small)
 
-    table.cell(stat_tbl, 0, 8, "🎯 TP2 Tam Hedef", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 8, "%" + str.tostring(tp2_wr, "0.0") + " (" + str.tostring(tp2_full_wins) + " işl.)", text_color=color.aqua, text_size=size.tiny)
+    table.cell(stat_tbl, 0, 10, "🎯 TP2 Tam Hedef", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 10, "%" + str.tostring(tp2_wr, "0.0") + " (" + str.tostring(tp2_full_wins) + " işl.)", text_color=color.aqua, text_size=size.tiny)
 
-    table.cell(stat_tbl, 0, 9, "💰 Net Kazanç", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 9, f_r_txt(total_net_r) + " (" + str.tostring(closed_count) + " kapanan)", text_color=f_r_col(total_net_r), text_size=size.small)
+    table.cell(stat_tbl, 0, 11, "💰 Net Kazanç", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 11, f_r_txt(total_net_r) + " (" + str.tostring(closed_count) + " kapanan)", text_color=f_r_col(total_net_r), text_size=size.small)
 
-    table.cell(stat_tbl, 0, 10, "📐 Ortalama R / İşlem", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 10, (avg_r >= 0 ? "+" : "") + str.tostring(avg_r, "0.00") + " R", text_color=f_r_col(avg_r), text_size=size.tiny)
+    table.cell(stat_tbl, 0, 12, "📐 Ortalama R / İşlem", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 12, (avg_r >= 0 ? "+" : "") + str.tostring(avg_r, "0.00") + " R", text_color=f_r_col(avg_r), text_size=size.tiny)
 
-    table.cell(stat_tbl, 0, 11, "⚖ Kâr Faktörü", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 11, pf_txt, text_color=pf_col, text_size=size.tiny)
+    table.cell(stat_tbl, 0, 13, "⚖ Kâr Faktörü", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 13, pf_txt, text_color=pf_col, text_size=size.tiny)
 
-    table.cell(stat_tbl, 0, 12, "📉 Maks. Düşüş", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 12, (max_dd_r > 0 ? "-" : "") + str.tostring(max_dd_r, "0.0") + " R", text_color=max_dd_r >= 5.0 ? color.red : max_dd_r >= 3.0 ? color.yellow : color.white, text_size=size.tiny)
+    table.cell(stat_tbl, 0, 14, "📉 Maks. Düşüş", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 14, (max_dd_r > 0 ? "-" : "") + str.tostring(max_dd_r, "0.0") + " R", text_color=max_dd_r >= 5.0 ? color.red : max_dd_r >= 3.0 ? color.yellow : color.white, text_size=size.tiny)
 
-    table.cell(stat_tbl, 0, 13, "🔻 Maks. Ardışık Kayıp", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 13, str.tostring(max_loss_streak) + " işlem", text_color=max_loss_streak >= 5 ? color.red : max_loss_streak >= 3 ? color.yellow : color.white, text_size=size.tiny)
+    table.cell(stat_tbl, 0, 15, "🔻 Maks. Ardışık Kayıp", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 15, str.tostring(max_loss_streak) + " işlem", text_color=max_loss_streak >= 5 ? color.red : max_loss_streak >= 3 ? color.yellow : color.white, text_size=size.tiny)
 
-    table.cell(stat_tbl, 0, 14, "🟢 LONG", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 14, l_closed > 0 ? f_r_txt(long_net_r) + " · %" + str.tostring(l_wr, "0") + " TP1 (" + str.tostring(long_tp1_w) + "W/" + str.tostring(long_sl_l) + "L)" : "İşlem yok", text_color=l_closed > 0 ? f_r_col(long_net_r) : color.gray, text_size=size.tiny)
+    table.cell(stat_tbl, 0, 16, "🟢 LONG", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 16, l_closed > 0 ? f_r_txt(long_net_r) + " · %" + str.tostring(l_wr, "0") + " TP1 (" + str.tostring(long_tp1_w) + "W/" + str.tostring(long_sl_l) + "L)" : "İşlem yok", text_color=l_closed > 0 ? f_r_col(long_net_r) : color.gray, text_size=size.tiny)
 
-    table.cell(stat_tbl, 0, 15, "🔴 SHORT", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 15, s_closed > 0 ? f_r_txt(short_net_r) + " · %" + str.tostring(s_wr, "0") + " TP1 (" + str.tostring(short_tp1_w) + "W/" + str.tostring(short_sl_l) + "L)" : "İşlem yok", text_color=s_closed > 0 ? f_r_col(short_net_r) : color.gray, text_size=size.tiny)
+    table.cell(stat_tbl, 0, 17, "🔴 SHORT", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 17, s_closed > 0 ? f_r_txt(short_net_r) + " · %" + str.tostring(s_wr, "0") + " TP1 (" + str.tostring(short_tp1_w) + "W/" + str.tostring(short_sl_l) + "L)" : "İşlem yok", text_color=s_closed > 0 ? f_r_col(short_net_r) : color.gray, text_size=size.tiny)
 
     // ---- Zaman dilimi karşılaştırması ----
-    table.cell(stat_tbl, 0, 16, "ZAMAN DİLİMİ KARŞILAŞTIRMASI (NET R)", text_color=color.white, text_size=size.tiny, bgcolor=c_sec, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 16, "", bgcolor=c_sec)
+    table.cell(stat_tbl, 0, 18, "ZAMAN DİLİMİ KARŞILAŞTIRMASI (NET R)", text_color=color.white, text_size=size.tiny, bgcolor=c_sec, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 18, "", bgcolor=c_sec)
 
-    table.cell(stat_tbl, 0, 17, "⏱ 5 Dakika", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 17, f_tf_row(r_5m, wr1_5m, cnt_5m), text_color=cnt_5m > 0 ? f_r_col(r_5m) : color.gray, text_size=size.tiny)
+    table.cell(stat_tbl, 0, 19, "⏱ 5 Dakika", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 19, f_tf_row(r_5m, wr1_5m, cnt_5m), text_color=cnt_5m > 0 ? f_r_col(r_5m) : color.gray, text_size=size.tiny)
 
-    table.cell(stat_tbl, 0, 18, "⏱ 15 Dakika", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 18, f_tf_row(r_15m, wr1_15m, cnt_15m), text_color=cnt_15m > 0 ? f_r_col(r_15m) : color.gray, text_size=size.tiny)
+    table.cell(stat_tbl, 0, 20, "⏱ 15 Dakika", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 20, f_tf_row(r_15m, wr1_15m, cnt_15m), text_color=cnt_15m > 0 ? f_r_col(r_15m) : color.gray, text_size=size.tiny)
 
-    table.cell(stat_tbl, 0, 19, "⏱ 1 Saat", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 19, f_tf_row(r_1h, wr1_1h, cnt_1h), text_color=cnt_1h > 0 ? f_r_col(r_1h) : color.gray, text_size=size.tiny)
+    table.cell(stat_tbl, 0, 21, "⏱ 1 Saat", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 21, f_tf_row(r_1h, wr1_1h, cnt_1h), text_color=cnt_1h > 0 ? f_r_col(r_1h) : color.gray, text_size=size.tiny)
 
-    table.cell(stat_tbl, 0, 20, "⏱ 4 Saat", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 20, f_tf_row(r_4h, wr1_4h, cnt_4h), text_color=cnt_4h > 0 ? f_r_col(r_4h) : color.gray, text_size=size.tiny)
+    table.cell(stat_tbl, 0, 22, "⏱ 4 Saat", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 22, f_tf_row(r_4h, wr1_4h, cnt_4h), text_color=cnt_4h > 0 ? f_r_col(r_4h) : color.gray, text_size=size.tiny)
 
-    table.cell(stat_tbl, 0, 21, "💡 EN İYİ PERİYOT (R)", text_color=color.yellow, text_size=size.tiny, bgcolor=color.new(color.teal, 40), text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 21, best_txt, text_color=best_col, text_size=size.small, bgcolor=color.new(color.teal, 40))
+    table.cell(stat_tbl, 0, 23, "💡 EN İYİ PERİYOT (R)", text_color=color.yellow, text_size=size.tiny, bgcolor=color.new(color.teal, 40), text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 23, best_txt, text_color=best_col, text_size=size.small, bgcolor=color.new(color.teal, 40))
