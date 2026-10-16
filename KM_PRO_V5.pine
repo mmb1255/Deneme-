@@ -22,6 +22,7 @@ grp_pnl = "Panel"
 show_panel    = input.bool(true, "Paneli Göster", group=grp_pnl)
 panel_pos_in  = input.string("Sağ Üst", "Panel Konumu", options=["Sağ Üst", "Sağ Alt", "Sol Üst", "Sol Alt"], group=grp_pnl)
 min_tf_trades = input.int(3, "En İyi Periyot İçin Min. İşlem Sayısı", minval=1, maxval=50, group=grp_pnl)
+rank_mode     = input.string("Net R", "En İyi Periyot Ölçütü", options=["Net R", "Günlük R (R/gün)"], group=grp_pnl, tooltip="Grafikte yüklü veri miktarı periyoda göre değişir. Periyotların kapsadığı gün sayısı farklıysa Günlük R daha adil bir karşılaştırmadır.")
 
 ms_limit      = lookback_days * 24 * 60 * 60 * 1000
 in_date_range = (timenow - time) <= ms_limit
@@ -51,15 +52,22 @@ f_dur_txt(int ms) =>
     _k = _m - _h * 60
     str.tostring(_m) + " dk" + (_m >= 60 ? " (" + str.tostring(_h) + "s " + str.tostring(_k) + "dk)" : "")
 
-f_tf_row(float r, float wr, int cnt) =>
-    cnt > 0 ? f_r_txt(r) + " · %" + str.tostring(wr, "0") + " TP1 (" + str.tostring(cnt) + " işl.)" : "İşlem yok"
+f_tf_row(float r, float wr, int cnt, float days) =>
+    _warn = days < lookback_days * 0.9 ? "⚠ " : ""
+    _cov  = " · " + str.tostring(days, "0") + "g veri"
+    cnt > 0 ? _warn + f_r_txt(r) + " · %" + str.tostring(wr, "0") + " TP1 (" + str.tostring(cnt) + " işl.)" + _cov : _warn + "İşlem yok" + _cov
 
 // ============================================================
 //  ÇOKLU ZAMAN DİLİMİ BACKTEST (request.security içinde çalışır)
-//  Döndürür: [işlem sayısı, TP1 oranı %, TP2 oranı %, net R, trend yönü]
+//  Döndürür: [işlem sayısı, TP1 oranı %, TP2 oranı %, net R, trend yönü, kapsanan gün]
 // ============================================================
 f_calc_tf_stats() =>
     _in_date = (timenow - time) <= ms_limit
+    // Bu periyotta backtest penceresine giren ilk barın zamanı -> gerçekten kaç gün veri var
+    var int _first_t = na
+    if _in_date and na(_first_t)
+        _first_t := time
+    _days = na(_first_t) ? 0.0 : (timenow - _first_t) / 86400000.0
     _ema21   = ta.ema(close, 21)
     _ema99   = ta.ema(close, 99)
     _ema200  = ta.ema(close, 200)
@@ -168,12 +176,12 @@ f_calc_tf_stats() =>
     _tot = _w1 + _ls
     _wr1 = _tot > 0 ? (float(_w1) / float(_tot)) * 100.0 : 0.0
     _wr2 = _tot > 0 ? (float(_w2) / float(_tot)) * 100.0 : 0.0
-    [_tot, _wr1, _wr2, _net_r, _tdir]
+    [_tot, _wr1, _wr2, _net_r, _tdir, _days]
 
-[cnt_5m,  wr1_5m,  wr2_5m,  r_5m,  td_5m]  = request.security(syminfo.tickerid, "5",   f_calc_tf_stats(), ignore_invalid_symbol=true)
-[cnt_15m, wr1_15m, wr2_15m, r_15m, td_15m] = request.security(syminfo.tickerid, "15",  f_calc_tf_stats(), ignore_invalid_symbol=true)
-[cnt_1h,  wr1_1h,  wr2_1h,  r_1h,  td_1h]  = request.security(syminfo.tickerid, "60",  f_calc_tf_stats(), ignore_invalid_symbol=true)
-[cnt_4h,  wr1_4h,  wr2_4h,  r_4h,  td_4h]  = request.security(syminfo.tickerid, "240", f_calc_tf_stats(), ignore_invalid_symbol=true)
+[cnt_5m,  wr1_5m,  wr2_5m,  r_5m,  td_5m,  dy_5m]  = request.security(syminfo.tickerid, "5",   f_calc_tf_stats(), ignore_invalid_symbol=true)
+[cnt_15m, wr1_15m, wr2_15m, r_15m, td_15m, dy_15m] = request.security(syminfo.tickerid, "15",  f_calc_tf_stats(), ignore_invalid_symbol=true)
+[cnt_1h,  wr1_1h,  wr2_1h,  r_1h,  td_1h,  dy_1h]  = request.security(syminfo.tickerid, "60",  f_calc_tf_stats(), ignore_invalid_symbol=true)
+[cnt_4h,  wr1_4h,  wr2_4h,  r_4h,  td_4h,  dy_4h]  = request.security(syminfo.tickerid, "240", f_calc_tf_stats(), ignore_invalid_symbol=true)
 
 // ============================================================
 //  GRAFİK ZAMAN DİLİMİ HESAPLARI
@@ -602,28 +610,34 @@ if show_panel and barstate.islast
 
     last_sig_txt = na(last_signal_bar) ? "—" : str.tostring(bar_index - last_signal_bar) + " bar önce (" + (last_signal_dir == 1 ? "LONG" : "SHORT") + ")"
 
-    // ---- En iyi periyot (NET R bazında) ----
+    // ---- En iyi periyot (Net R ya da R/gün) ----
+    use_daily = rank_mode != "Net R"
+    sc_5m  = use_daily ? (dy_5m  > 0 ? r_5m  / dy_5m  : -1.0e9) : r_5m
+    sc_15m = use_daily ? (dy_15m > 0 ? r_15m / dy_15m : -1.0e9) : r_15m
+    sc_1h  = use_daily ? (dy_1h  > 0 ? r_1h  / dy_1h  : -1.0e9) : r_1h
+    sc_4h  = use_daily ? (dy_4h  > 0 ? r_4h  / dy_4h  : -1.0e9) : r_4h
     string best_tf_str = ""
-    float  best_tf_r   = -1.0e9
+    float  best_tf_sc  = -1.0e9
     bool   best_found  = false
-    if cnt_5m >= min_tf_trades and r_5m > best_tf_r
+    if cnt_5m >= min_tf_trades and sc_5m > best_tf_sc
         best_tf_str := "5 DAKİKA"
-        best_tf_r   := r_5m
+        best_tf_sc  := sc_5m
         best_found  := true
-    if cnt_15m >= min_tf_trades and r_15m > best_tf_r
+    if cnt_15m >= min_tf_trades and sc_15m > best_tf_sc
         best_tf_str := "15 DAKİKA"
-        best_tf_r   := r_15m
+        best_tf_sc  := sc_15m
         best_found  := true
-    if cnt_1h >= min_tf_trades and r_1h > best_tf_r
+    if cnt_1h >= min_tf_trades and sc_1h > best_tf_sc
         best_tf_str := "1 SAAT"
-        best_tf_r   := r_1h
+        best_tf_sc  := sc_1h
         best_found  := true
-    if cnt_4h >= min_tf_trades and r_4h > best_tf_r
+    if cnt_4h >= min_tf_trades and sc_4h > best_tf_sc
         best_tf_str := "4 SAAT"
-        best_tf_r   := r_4h
+        best_tf_sc  := sc_4h
         best_found  := true
-    best_txt = not best_found ? "YETERSİZ VERİ (min " + str.tostring(min_tf_trades) + " işl.)" : best_tf_r > 0 ? "🔥 " + best_tf_str + " (" + f_r_txt(best_tf_r) + ")" : "⚠ " + best_tf_str + " (" + f_r_txt(best_tf_r) + ") · hepsi zararda"
-    best_col = not best_found ? color.gray : best_tf_r > 0 ? color.yellow : color.orange
+    best_val_txt = use_daily ? (best_tf_sc >= 0 ? "+" : "") + str.tostring(best_tf_sc, "0.00") + " R/gün" : f_r_txt(best_tf_sc)
+    best_txt = not best_found ? "YETERSİZ VERİ (min " + str.tostring(min_tf_trades) + " işl.)" : best_tf_sc > 0 ? "🔥 " + best_tf_str + " (" + best_val_txt + ")" : "⚠ " + best_tf_str + " (" + best_val_txt + ") · hepsi zararda"
+    best_col = not best_found ? color.gray : best_tf_sc > 0 ? color.yellow : color.orange
 
     wr1_col = tp1_wr >= 55.0 ? color.lime : tp1_wr >= 45.0 ? color.yellow : color.red
 
@@ -685,20 +699,20 @@ if show_panel and barstate.islast
     table.cell(stat_tbl, 1, 17, s_closed > 0 ? f_r_txt(short_net_r) + " · %" + str.tostring(s_wr, "0") + " TP1 (" + str.tostring(short_tp1_w) + "W/" + str.tostring(short_sl_l) + "L)" : "İşlem yok", text_color=s_closed > 0 ? f_r_col(short_net_r) : color.gray, text_size=size.tiny)
 
     // ---- Zaman dilimi karşılaştırması ----
-    table.cell(stat_tbl, 0, 18, "ZAMAN DİLİMİ KARŞILAŞTIRMASI (NET R)", text_color=color.white, text_size=size.tiny, bgcolor=c_sec, text_halign=text.align_left)
+    table.cell(stat_tbl, 0, 18, "ZAMAN DİLİMİ (NET R) · ⚠ = eksik veri", text_color=color.white, text_size=size.tiny, bgcolor=c_sec, text_halign=text.align_left)
     table.cell(stat_tbl, 1, 18, "", bgcolor=c_sec)
 
     table.cell(stat_tbl, 0, 19, "⏱ 5 Dakika", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 19, f_tf_row(r_5m, wr1_5m, cnt_5m), text_color=cnt_5m > 0 ? f_r_col(r_5m) : color.gray, text_size=size.tiny)
+    table.cell(stat_tbl, 1, 19, f_tf_row(r_5m, wr1_5m, cnt_5m, dy_5m), text_color=cnt_5m > 0 ? f_r_col(r_5m) : color.gray, text_size=size.tiny)
 
     table.cell(stat_tbl, 0, 20, "⏱ 15 Dakika", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 20, f_tf_row(r_15m, wr1_15m, cnt_15m), text_color=cnt_15m > 0 ? f_r_col(r_15m) : color.gray, text_size=size.tiny)
+    table.cell(stat_tbl, 1, 20, f_tf_row(r_15m, wr1_15m, cnt_15m, dy_15m), text_color=cnt_15m > 0 ? f_r_col(r_15m) : color.gray, text_size=size.tiny)
 
     table.cell(stat_tbl, 0, 21, "⏱ 1 Saat", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 21, f_tf_row(r_1h, wr1_1h, cnt_1h), text_color=cnt_1h > 0 ? f_r_col(r_1h) : color.gray, text_size=size.tiny)
+    table.cell(stat_tbl, 1, 21, f_tf_row(r_1h, wr1_1h, cnt_1h, dy_1h), text_color=cnt_1h > 0 ? f_r_col(r_1h) : color.gray, text_size=size.tiny)
 
     table.cell(stat_tbl, 0, 22, "⏱ 4 Saat", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 22, f_tf_row(r_4h, wr1_4h, cnt_4h), text_color=cnt_4h > 0 ? f_r_col(r_4h) : color.gray, text_size=size.tiny)
+    table.cell(stat_tbl, 1, 22, f_tf_row(r_4h, wr1_4h, cnt_4h, dy_4h), text_color=cnt_4h > 0 ? f_r_col(r_4h) : color.gray, text_size=size.tiny)
 
-    table.cell(stat_tbl, 0, 23, "💡 EN İYİ PERİYOT (R)", text_color=color.yellow, text_size=size.tiny, bgcolor=color.new(color.teal, 40), text_halign=text.align_left)
+    table.cell(stat_tbl, 0, 23, "💡 EN İYİ PERİYOT (" + (use_daily ? "R/gün" : "Net R") + ")", text_color=color.yellow, text_size=size.tiny, bgcolor=color.new(color.teal, 40), text_halign=text.align_left)
     table.cell(stat_tbl, 1, 23, best_txt, text_color=best_col, text_size=size.small, bgcolor=color.new(color.teal, 40))

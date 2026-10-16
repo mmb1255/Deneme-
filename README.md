@@ -42,7 +42,8 @@ Bar içinde tam olarak hangi dakikada vurulduğu bilinemez; hassasiyet grafik pe
 ## Bilinmesi gerekenler (gerçekçi notlar)
 
 - Bu bir **indikatör**, strateji değil: komisyon, kayma (slippage) ve pozisyon boyutu hesaba katılmaz. Rakamlar yön göstericidir.
-- Zaman dilimi satırları `request.security` ile hesaplanır. Grafikten **daha düşük** periyotlar (örn. 1 saatlik grafikte 5 dk satırı) örneklenmiş veriyle hesaplanır; en güvenilir karşılaştırma için grafiği 5 dakikaya alıp panele bak.
+- **Grafikteki veri miktarı periyoda göre değişir.** TradingView ücretsiz planda yaklaşık 5000 bar yükler; 5 dakikalık grafikte bu ~17 gün eder, yani "son 30 gün" penceresi dolmaz. Aynı sembolde 15 dk grafikten istenen 5 dk verisi ise 30 günün tamamını kapsayabilir. Bu yüzden 5 dk satırı farklı grafiklerde farklı çıkabilir. Panel her satırda gerçekten kaç günlük veri olduğunu (`17g veri`) gösterir ve pencere dolmadıysa `⚠` koyar. Periyotların gün sayısı farklıysa "En İyi Periyot Ölçütü" ayarını **Günlük R** yap, karşılaştırma adil olur.
+- PERFORMANS bloğu ile zaman dilimi satırları aynı sayıyı vermez: PERFORMANS bloğu TP1 şans filtresi ve likidite süpürme koşulu dahil tam mantığı kullanır, zaman dilimi satırları filtresiz sadeleştirilmiş mantığı kullanır.
 - Zaman dilimi versiyonunda likidite süpürme (BSL/SSL) koşulu yoktur; grafik periyodundaki sinyal mantığının biraz sadeleştirilmiş hâlidir.
 - Backtest penceresi "şu andan geriye N gün" olduğundan zaman geçtikçe pencere kayar ve sayılar değişir.
 - Aynı barda hem stop hem TP görülürse önce stop sayılır (muhafazakâr yaklaşım).
