@@ -22,9 +22,16 @@ grp_pnl = "Panel"
 show_panel    = input.bool(true, "Paneli Göster", group=grp_pnl)
 panel_pos_in  = input.string("Sağ Üst", "Panel Konumu", options=["Sağ Üst", "Sağ Alt", "Sol Üst", "Sol Alt"], group=grp_pnl)
 min_tf_trades = input.int(3, "En İyi Periyot İçin Min. İşlem Sayısı", minval=1, maxval=50, group=grp_pnl)
+cmp_days      = input.int(14, "Periyot Karşılaştırma Penceresi (Gün)", minval=1, maxval=365, group=grp_pnl, tooltip="En iyi periyot bu ortak pencerede seçilir. Tüm periyotların kesin doldurabildiği bir süre seç (ücretsiz planda 5 dk grafikte ~17 gün veri olur). Böylece sıralama hangi grafikten bakarsan bak aynı kalır.")
 rank_mode     = input.string("Net R", "En İyi Periyot Ölçütü", options=["Net R", "Günlük R (R/gün)"], group=grp_pnl, tooltip="Grafikte yüklü veri miktarı periyoda göre değişir. Periyotların kapsadığı gün sayısı farklıysa Günlük R daha adil bir karşılaştırmadır.")
 
+grp_tg = "Telegram / Webhook"
+tg_chat_id    = input.string("", "Telegram Chat ID (boş = düz metin alarm)", group=grp_tg, tooltip="Doluysa alert() mesajları Telegram sendMessage için JSON formatında üretilir. Alarm oluştururken koşul olarak 'Any alert() function call' seç ve Webhook URL'ye https://api.telegram.org/bot<TOKEN>/sendMessage yaz. Bot token'ı asla koda yazma.")
+tg_on_close   = input.bool(true, "İşlem kapanışlarını da bildir (TP / STOP)", group=grp_tg)
+
 ms_limit      = lookback_days * 24 * 60 * 60 * 1000
+cmp_eff       = math.min(cmp_days, lookback_days)
+cmp_ms        = cmp_eff * 24 * 60 * 60 * 1000
 in_date_range = (timenow - time) <= ms_limit
 
 // R muhasebesi: TP1'de pozisyonun yarısı kapanır, kalan yarı TP2'den ya da girişten (BE) çıkar.
@@ -52,17 +59,25 @@ f_dur_txt(int ms) =>
     _k = _m - _h * 60
     str.tostring(_m) + " dk" + (_m >= 60 ? " (" + str.tostring(_h) + "s " + str.tostring(_k) + "dk)" : "")
 
-f_tf_row(float r, float wr, int cnt, float days) =>
-    _warn = days < lookback_days * 0.9 ? "⚠ " : ""
-    _cov  = " · " + str.tostring(days, "0") + "g veri"
-    cnt > 0 ? _warn + f_r_txt(r) + " · %" + str.tostring(wr, "0") + " TP1 (" + str.tostring(cnt) + " işl.)" + _cov : _warn + "İşlem yok" + _cov
+// Telegram JSON gövdesi: TradingView mesaj geçerli JSON ise application/json olarak POST eder,
+// Telegram da chat_id/text alanlarını doğrudan okur. Metinde çift tırnak kullanma.
+f_tg_msg(string txt) =>
+    str.length(tg_chat_id) > 0 ? "{\"chat_id\": \"" + tg_chat_id + "\", \"text\": \"" + txt + "\"}" : str.replace_all(txt, "\\n", "\n")
+
+f_tf_row(float r, float wr, int cnt, float days, float rc, int cntc) =>
+    _warn = days < cmp_eff * 0.95 ? "⚠ " : ""
+    _full = cnt > 0 ? f_r_txt(r) + " · %" + str.tostring(wr, "0") + " · " + str.tostring(cnt) + " işl." : "İşlem yok"
+    _cmp  = cntc > 0 ? f_r_txt(rc) + " (" + str.tostring(cntc) + ")" : "—"
+    _warn + _full + " · " + str.tostring(days, "0") + "g  |  " + str.tostring(cmp_eff) + "g: " + _cmp
 
 // ============================================================
 //  ÇOKLU ZAMAN DİLİMİ BACKTEST (request.security içinde çalışır)
-//  Döndürür: [işlem sayısı, TP1 oranı %, TP2 oranı %, net R, trend yönü, kapsanan gün]
+//  Döndürür: [işlem sayısı, TP1 oranı %, TP2 oranı %, net R, trend yönü, kapsanan gün,
+//             ortak pencere işlem sayısı, ortak pencere net R]
 // ============================================================
 f_calc_tf_stats() =>
     _in_date = (timenow - time) <= ms_limit
+    _in_cmp  = (timenow - time) <= cmp_ms
     // Bu periyotta backtest penceresine giren ilk barın zamanı -> gerçekten kaç gün veri var
     var int _first_t = na
     if _in_date and na(_first_t)
@@ -118,6 +133,12 @@ f_calc_tf_stats() =>
     var int _w2 = 0
     var int _ls = 0
     var float _net_r = 0.0
+    // Ortak karşılaştırma penceresi sayaçları (giriş zamanı pencere içindeyse sayılır)
+    var bool _trade_cmp = false
+    var int _totc = 0
+    var float _net_rc = 0.0
+    int _ck = 0
+    float _cr = 0.0
 
     if _dir == 1
         if not _t1_ok
@@ -125,6 +146,8 @@ f_calc_tf_stats() =>
                 _ls += 1
                 _net_r -= 1.0
                 _dir := 0
+                _ck := 1
+                _cr := -1.0
             else if high >= _tp1
                 _t1_ok := true
                 _w1 += 1
@@ -132,20 +155,28 @@ f_calc_tf_stats() =>
                     _w2 += 1
                     _net_r += full_win_r
                     _dir := 0
+                    _ck := 2
+                    _cr := full_win_r
         else
             if high >= _tp2
                 _w2 += 1
                 _net_r += full_win_r
                 _dir := 0
+                _ck := 2
+                _cr := full_win_r
             else if low <= _ep
                 _net_r += half_win_r
                 _dir := 0
+                _ck := 3
+                _cr := half_win_r
     else if _dir == -1
         if not _t1_ok
             if high >= _sl
                 _ls += 1
                 _net_r -= 1.0
                 _dir := 0
+                _ck := 1
+                _cr := -1.0
             else if low <= _tp1
                 _t1_ok := true
                 _w1 += 1
@@ -153,14 +184,24 @@ f_calc_tf_stats() =>
                     _w2 += 1
                     _net_r += full_win_r
                     _dir := 0
+                    _ck := 2
+                    _cr := full_win_r
         else
             if low <= _tp2
                 _w2 += 1
                 _net_r += full_win_r
                 _dir := 0
+                _ck := 2
+                _cr := full_win_r
             else if high >= _ep
                 _net_r += half_win_r
                 _dir := 0
+                _ck := 3
+                _cr := half_win_r
+
+    if _ck != 0 and _trade_cmp
+        _totc   += 1
+        _net_rc += _cr
 
     _nl = (_dir == 0) and _in_date and (_abs_l or _mom_l)
     _ns = (_dir == 0) and _in_date and (_abs_s or _mom_s) and not _nl
@@ -172,16 +213,17 @@ f_calc_tf_stats() =>
         _tp1   := _nl ? (close + _r * tp1_rr) : (close - _r * tp1_rr)
         _tp2   := _nl ? (close + _r * tp2_rr) : (close - _r * tp2_rr)
         _t1_ok := false
+        _trade_cmp := _in_cmp
 
     _tot = _w1 + _ls
     _wr1 = _tot > 0 ? (float(_w1) / float(_tot)) * 100.0 : 0.0
     _wr2 = _tot > 0 ? (float(_w2) / float(_tot)) * 100.0 : 0.0
-    [_tot, _wr1, _wr2, _net_r, _tdir, _days]
+    [_tot, _wr1, _wr2, _net_r, _tdir, _days, _totc, _net_rc]
 
-[cnt_5m,  wr1_5m,  wr2_5m,  r_5m,  td_5m,  dy_5m]  = request.security(syminfo.tickerid, "5",   f_calc_tf_stats(), ignore_invalid_symbol=true)
-[cnt_15m, wr1_15m, wr2_15m, r_15m, td_15m, dy_15m] = request.security(syminfo.tickerid, "15",  f_calc_tf_stats(), ignore_invalid_symbol=true)
-[cnt_1h,  wr1_1h,  wr2_1h,  r_1h,  td_1h,  dy_1h]  = request.security(syminfo.tickerid, "60",  f_calc_tf_stats(), ignore_invalid_symbol=true)
-[cnt_4h,  wr1_4h,  wr2_4h,  r_4h,  td_4h,  dy_4h]  = request.security(syminfo.tickerid, "240", f_calc_tf_stats(), ignore_invalid_symbol=true)
+[cnt_5m,  wr1_5m,  wr2_5m,  r_5m,  td_5m,  dy_5m,  cc_5m,  rc_5m]  = request.security(syminfo.tickerid, "5",   f_calc_tf_stats(), ignore_invalid_symbol=true)
+[cnt_15m, wr1_15m, wr2_15m, r_15m, td_15m, dy_15m, cc_15m, rc_15m] = request.security(syminfo.tickerid, "15",  f_calc_tf_stats(), ignore_invalid_symbol=true)
+[cnt_1h,  wr1_1h,  wr2_1h,  r_1h,  td_1h,  dy_1h,  cc_1h,  rc_1h]  = request.security(syminfo.tickerid, "60",  f_calc_tf_stats(), ignore_invalid_symbol=true)
+[cnt_4h,  wr1_4h,  wr2_4h,  r_4h,  td_4h,  dy_4h,  cc_4h,  rc_4h]  = request.security(syminfo.tickerid, "240", f_calc_tf_stats(), ignore_invalid_symbol=true)
 
 // ============================================================
 //  GRAFİK ZAMAN DİLİMİ HESAPLARI
@@ -459,6 +501,8 @@ trade_dur_ms = time_close - entry_t
 if tp1_now and close_kind == 0 and show_res_lbl
     _d = active_dir == 1
     label.new(bar_index, _d ? high : low, "✔ TP1 · stop BE · " + f_dur_txt(trade_dur_ms), color=color.new(color.teal, 20), textcolor=color.white, style=_d ? label.style_label_down : label.style_label_up, size=size.tiny)
+    if tg_on_close
+        alert(f_tg_msg("✔ TP1 vuruldu · " + (_d ? "LONG" : "SHORT") + " · " + syminfo.ticker + " · " + timeframe.period + "\\nYarısı kapandı, stop girişe çekildi\\nSüre: " + f_dur_txt(trade_dur_ms)), alert.freq_once_per_bar_close)
 
 if close_kind != 0
     _is_win  = close_kind != 1
@@ -477,6 +521,9 @@ if close_kind != 0
 
     last_res_txt := _side + " " + _txt
     last_res_col := _col
+
+    if tg_on_close
+        alert(f_tg_msg(_res + " · " + _side + " · " + syminfo.ticker + " · " + timeframe.period + "\\nSonuç: " + f_r_txt(closed_r) + "\\nSüre: " + _dur_txt + "\\nToplam: " + f_r_txt(total_net_r)), alert.freq_once_per_bar_close)
 
     if show_res_lbl
         // Kazanç etiketi fiyatın gittiği tarafta, stop etiketi ters tarafta
@@ -524,6 +571,7 @@ if new_long
     entry_t         := time_close
 
     label.new(bar_index, low, "🚀 LONG | TP1: %" + str.tostring(prob_tp1_l, "#"), color=color.green, textcolor=color.white, style=label.style_label_up, size=size.small)
+    alert(f_tg_msg("🚀 KM LONG · " + syminfo.ticker + " · " + timeframe.period + "\\nGiriş: " + str.tostring(entry_p, format.mintick) + "\\nSL: " + str.tostring(sl_p, format.mintick) + "\\nTP1: " + str.tostring(tp1_p, format.mintick) + "\\nTP2: " + str.tostring(tp2_p, format.mintick) + "\\nTP1 şansı: %" + str.tostring(prob_tp1_l, "#")), alert.freq_once_per_bar_close)
     l_ent  := line.new(bar_index, entry_p, bar_index + 5, entry_p, color=color.yellow, width=2)
     l_sl   := line.new(bar_index, sl_p, bar_index + 5, sl_p, color=color.red, width=2)
     l_tp1  := line.new(bar_index, tp1_p, bar_index + 5, tp1_p, color=color.teal, width=1, style=line.style_dashed)
@@ -548,6 +596,7 @@ if new_short
     entry_t         := time_close
 
     label.new(bar_index, high, "🩸 SHORT | TP1: %" + str.tostring(prob_tp1_s, "#"), color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small)
+    alert(f_tg_msg("🩸 KM SHORT · " + syminfo.ticker + " · " + timeframe.period + "\\nGiriş: " + str.tostring(entry_p, format.mintick) + "\\nSL: " + str.tostring(sl_p, format.mintick) + "\\nTP1: " + str.tostring(tp1_p, format.mintick) + "\\nTP2: " + str.tostring(tp2_p, format.mintick) + "\\nTP1 şansı: %" + str.tostring(prob_tp1_s, "#")), alert.freq_once_per_bar_close)
     l_ent  := line.new(bar_index, entry_p, bar_index + 5, entry_p, color=color.yellow, width=2)
     l_sl   := line.new(bar_index, sl_p, bar_index + 5, sl_p, color=color.red, width=2)
     l_tp1  := line.new(bar_index, tp1_p, bar_index + 5, tp1_p, color=color.teal, width=1, style=line.style_dashed)
@@ -611,32 +660,39 @@ if show_panel and barstate.islast
     last_sig_txt = na(last_signal_bar) ? "—" : str.tostring(bar_index - last_signal_bar) + " bar önce (" + (last_signal_dir == 1 ? "LONG" : "SHORT") + ")"
 
     // ---- En iyi periyot (Net R ya da R/gün) ----
+    // Sıralama ortak pencerede (cmp_eff gün) yapılır; böylece hangi grafikten bakılırsa bakılsın aynı sonucu verir.
     use_daily = rank_mode != "Net R"
-    sc_5m  = use_daily ? (dy_5m  > 0 ? r_5m  / dy_5m  : -1.0e9) : r_5m
-    sc_15m = use_daily ? (dy_15m > 0 ? r_15m / dy_15m : -1.0e9) : r_15m
-    sc_1h  = use_daily ? (dy_1h  > 0 ? r_1h  / dy_1h  : -1.0e9) : r_1h
-    sc_4h  = use_daily ? (dy_4h  > 0 ? r_4h  / dy_4h  : -1.0e9) : r_4h
+    d_5m  = math.min(dy_5m,  cmp_eff)
+    d_15m = math.min(dy_15m, cmp_eff)
+    d_1h  = math.min(dy_1h,  cmp_eff)
+    d_4h  = math.min(dy_4h,  cmp_eff)
+    sc_5m  = use_daily ? (d_5m  > 0 ? rc_5m  / d_5m  : -1.0e9) : rc_5m
+    sc_15m = use_daily ? (d_15m > 0 ? rc_15m / d_15m : -1.0e9) : rc_15m
+    sc_1h  = use_daily ? (d_1h  > 0 ? rc_1h  / d_1h  : -1.0e9) : rc_1h
+    sc_4h  = use_daily ? (d_4h  > 0 ? rc_4h  / d_4h  : -1.0e9) : rc_4h
+    cov_warn = math.min(math.min(dy_5m, dy_15m), math.min(dy_1h, dy_4h)) < cmp_eff * 0.95
     string best_tf_str = ""
     float  best_tf_sc  = -1.0e9
     bool   best_found  = false
-    if cnt_5m >= min_tf_trades and sc_5m > best_tf_sc
+    if cc_5m >= min_tf_trades and sc_5m > best_tf_sc
         best_tf_str := "5 DAKİKA"
         best_tf_sc  := sc_5m
         best_found  := true
-    if cnt_15m >= min_tf_trades and sc_15m > best_tf_sc
+    if cc_15m >= min_tf_trades and sc_15m > best_tf_sc
         best_tf_str := "15 DAKİKA"
         best_tf_sc  := sc_15m
         best_found  := true
-    if cnt_1h >= min_tf_trades and sc_1h > best_tf_sc
+    if cc_1h >= min_tf_trades and sc_1h > best_tf_sc
         best_tf_str := "1 SAAT"
         best_tf_sc  := sc_1h
         best_found  := true
-    if cnt_4h >= min_tf_trades and sc_4h > best_tf_sc
+    if cc_4h >= min_tf_trades and sc_4h > best_tf_sc
         best_tf_str := "4 SAAT"
         best_tf_sc  := sc_4h
         best_found  := true
     best_val_txt = use_daily ? (best_tf_sc >= 0 ? "+" : "") + str.tostring(best_tf_sc, "0.00") + " R/gün" : f_r_txt(best_tf_sc)
     best_txt = not best_found ? "YETERSİZ VERİ (min " + str.tostring(min_tf_trades) + " işl.)" : best_tf_sc > 0 ? "🔥 " + best_tf_str + " (" + best_val_txt + ")" : "⚠ " + best_tf_str + " (" + best_val_txt + ") · hepsi zararda"
+    best_txt := (cov_warn ? "⚠ veri eksik · " : "") + best_txt
     best_col = not best_found ? color.gray : best_tf_sc > 0 ? color.yellow : color.orange
 
     wr1_col = tp1_wr >= 55.0 ? color.lime : tp1_wr >= 45.0 ? color.yellow : color.red
@@ -699,20 +755,20 @@ if show_panel and barstate.islast
     table.cell(stat_tbl, 1, 17, s_closed > 0 ? f_r_txt(short_net_r) + " · %" + str.tostring(s_wr, "0") + " TP1 (" + str.tostring(short_tp1_w) + "W/" + str.tostring(short_sl_l) + "L)" : "İşlem yok", text_color=s_closed > 0 ? f_r_col(short_net_r) : color.gray, text_size=size.tiny)
 
     // ---- Zaman dilimi karşılaştırması ----
-    table.cell(stat_tbl, 0, 18, "ZAMAN DİLİMİ (NET R) · ⚠ = eksik veri", text_color=color.white, text_size=size.tiny, bgcolor=c_sec, text_halign=text.align_left)
+    table.cell(stat_tbl, 0, 18, "ZAMAN DİLİMİ · tam pencere | son " + str.tostring(cmp_eff) + "g", text_color=color.white, text_size=size.tiny, bgcolor=c_sec, text_halign=text.align_left)
     table.cell(stat_tbl, 1, 18, "", bgcolor=c_sec)
 
     table.cell(stat_tbl, 0, 19, "⏱ 5 Dakika", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 19, f_tf_row(r_5m, wr1_5m, cnt_5m, dy_5m), text_color=cnt_5m > 0 ? f_r_col(r_5m) : color.gray, text_size=size.tiny)
+    table.cell(stat_tbl, 1, 19, f_tf_row(r_5m, wr1_5m, cnt_5m, dy_5m, rc_5m, cc_5m), text_color=cnt_5m > 0 ? f_r_col(r_5m) : color.gray, text_size=size.tiny)
 
     table.cell(stat_tbl, 0, 20, "⏱ 15 Dakika", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 20, f_tf_row(r_15m, wr1_15m, cnt_15m, dy_15m), text_color=cnt_15m > 0 ? f_r_col(r_15m) : color.gray, text_size=size.tiny)
+    table.cell(stat_tbl, 1, 20, f_tf_row(r_15m, wr1_15m, cnt_15m, dy_15m, rc_15m, cc_15m), text_color=cnt_15m > 0 ? f_r_col(r_15m) : color.gray, text_size=size.tiny)
 
     table.cell(stat_tbl, 0, 21, "⏱ 1 Saat", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 21, f_tf_row(r_1h, wr1_1h, cnt_1h, dy_1h), text_color=cnt_1h > 0 ? f_r_col(r_1h) : color.gray, text_size=size.tiny)
+    table.cell(stat_tbl, 1, 21, f_tf_row(r_1h, wr1_1h, cnt_1h, dy_1h, rc_1h, cc_1h), text_color=cnt_1h > 0 ? f_r_col(r_1h) : color.gray, text_size=size.tiny)
 
     table.cell(stat_tbl, 0, 22, "⏱ 4 Saat", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(stat_tbl, 1, 22, f_tf_row(r_4h, wr1_4h, cnt_4h, dy_4h), text_color=cnt_4h > 0 ? f_r_col(r_4h) : color.gray, text_size=size.tiny)
+    table.cell(stat_tbl, 1, 22, f_tf_row(r_4h, wr1_4h, cnt_4h, dy_4h, rc_4h, cc_4h), text_color=cnt_4h > 0 ? f_r_col(r_4h) : color.gray, text_size=size.tiny)
 
-    table.cell(stat_tbl, 0, 23, "💡 EN İYİ PERİYOT (" + (use_daily ? "R/gün" : "Net R") + ")", text_color=color.yellow, text_size=size.tiny, bgcolor=color.new(color.teal, 40), text_halign=text.align_left)
+    table.cell(stat_tbl, 0, 23, "💡 EN İYİ PERİYOT (son " + str.tostring(cmp_eff) + "g · " + (use_daily ? "R/gün" : "Net R") + ")", text_color=color.yellow, text_size=size.tiny, bgcolor=color.new(color.teal, 40), text_halign=text.align_left)
     table.cell(stat_tbl, 1, 23, best_txt, text_color=best_col, text_size=size.small, bgcolor=color.new(color.teal, 40))

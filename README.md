@@ -47,3 +47,20 @@ Bar içinde tam olarak hangi dakikada vurulduğu bilinemez; hassasiyet grafik pe
 - Zaman dilimi versiyonunda likidite süpürme (BSL/SSL) koşulu yoktur; grafik periyodundaki sinyal mantığının biraz sadeleştirilmiş hâlidir.
 - Backtest penceresi "şu andan geriye N gün" olduğundan zaman geçtikçe pencere kayar ve sayılar değişir.
 - Aynı barda hem stop hem TP görülürse önce stop sayılır (muhafazakâr yaklaşım).
+
+## Telegram bildirimi
+
+İndikatör sinyal ve kapanışlarda `alert()` çağırır. Telegram'a düşmesi için:
+
+1. **TradingView'da Webhook gerekir.** Webhook sadece ücretli planlarda (Essential ve üstü) vardır. Ücretsiz planda Telegram'a gönderim mümkün değildir; sadece uygulama/e-posta bildirimi çalışır.
+2. BotFather'dan bot oluştur, token al. **Token'ı kimseyle paylaşma ve koda yazma.** Yanlışlıkla paylaştıysan BotFather'da `/revoke` ile yenisini al.
+3. Telegram'da botunu aç ve **Start**'a bas (bot sana ilk mesajı atamaz, önce sen başlatmalısın).
+4. İndikatör ayarlarında "Telegram Chat ID" alanına kendi kullanıcı ID'ni yaz.
+5. Grafikte alarm oluştur:
+   - Koşul: **KM PRO V5 → Any alert() function call**
+   - Webhook URL: `https://api.telegram.org/bot<TOKEN>/sendMessage`
+   - Mesaj kutusunu boş bırak ya da olduğu gibi bırak; metin indikatörden gelir.
+6. Test etmek için tarayıcıdan şunu aç, Telegram'a mesaj düşmeli:
+   `https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<CHAT_ID>&text=test`
+
+Chat ID boşsa mesajlar düz metin üretilir; bu durumda uygulama bildirimi ve e-posta için kullanılabilir.
