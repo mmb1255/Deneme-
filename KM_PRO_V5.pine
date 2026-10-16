@@ -1,0 +1,611 @@
+//@version=6
+indicator("KM PRO V5", shorttitle="KM-V5", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ============================================================
+//  GİRDİLER
+// ============================================================
+grp_core = "Strateji"
+lookback_days = input.int(30, "Backtest Süresi (Gün)", minval=1, maxval=365, group=grp_core)
+min_prob_filt = input.int(50, "Min TP1 Şansı Filtresi (%)", minval=0, maxval=85, step=5, group=grp_core)
+use_mtf_trend = input.bool(true, "EMA 200 Trend Filtresi", group=grp_core)
+sl_atr_mult   = input.float(1.4, "Stop Loss ATR", step=0.1, group=grp_core)
+tp1_rr        = input.float(1.0, "TP1 Hedef (R)", step=0.1, group=grp_core)
+tp2_rr        = input.float(2.2, "TP2 Hedef (R)", step=0.1, group=grp_core)
+
+grp_vis = "Görsel"
+show_fvg      = input.bool(true, "FVG Göster", group=grp_vis)
+show_liq      = input.bool(true, "Likidite Göster", group=grp_vis)
+liq_pivot_len = input.int(10, "Likidite Hassasiyeti", minval=4, maxval=30, group=grp_vis)
+
+grp_pnl = "Panel"
+show_panel    = input.bool(true, "Paneli Göster", group=grp_pnl)
+panel_pos_in  = input.string("Sağ Üst", "Panel Konumu", options=["Sağ Üst", "Sağ Alt", "Sol Üst", "Sol Alt"], group=grp_pnl)
+min_tf_trades = input.int(3, "En İyi Periyot İçin Min. İşlem Sayısı", minval=1, maxval=50, group=grp_pnl)
+
+ms_limit      = lookback_days * 24 * 60 * 60 * 1000
+in_date_range = (timenow - time) <= ms_limit
+
+// R muhasebesi: TP1'de pozisyonun yarısı kapanır, kalan yarı TP2'den ya da girişten (BE) çıkar.
+full_win_r = 0.5 * tp1_rr + 0.5 * tp2_rr
+half_win_r = 0.5 * tp1_rr
+
+// ============================================================
+//  YARDIMCI FONKSİYONLAR
+// ============================================================
+f_r_txt(float r) =>
+    (r >= 0 ? "+" : "") + str.tostring(r, "0.0") + " R"
+
+f_r_col(float r) =>
+    r > 0 ? color.lime : r < 0 ? color.red : color.gray
+
+f_dir_txt(int d) =>
+    d == 1 ? "↑ Yükseliş" : d == -1 ? "↓ Düşüş" : "→ Yatay"
+
+f_dir_col(int d) =>
+    d == 1 ? color.lime : d == -1 ? color.red : color.gray
+
+f_tf_row(float r, float wr, int cnt) =>
+    cnt > 0 ? f_r_txt(r) + " · %" + str.tostring(wr, "0") + " TP1 (" + str.tostring(cnt) + " işl.)" : "İşlem yok"
+
+// ============================================================
+//  ÇOKLU ZAMAN DİLİMİ BACKTEST (request.security içinde çalışır)
+//  Döndürür: [işlem sayısı, TP1 oranı %, TP2 oranı %, net R, trend yönü]
+// ============================================================
+f_calc_tf_stats() =>
+    _in_date = (timenow - time) <= ms_limit
+    _ema21   = ta.ema(close, 21)
+    _ema99   = ta.ema(close, 99)
+    _ema200  = ta.ema(close, 200)
+    _atr     = ta.atr(14)
+    [_dip, _dim, _adx] = ta.dmi(14, 14)
+    _rsi     = ta.rsi(close, 14)
+    _rmin    = ta.lowest(_rsi, 14)
+    _rmax    = ta.highest(_rsi, 14)
+    _stoch   = (_rmax - _rmin) == 0 ? 50.0 : (_rsi - _rmin) / (_rmax - _rmin) * 100.0
+    _stoch_k = ta.sma(_stoch, 3)
+
+    _l9  = ta.lowest(low, 9)
+    _h9  = ta.highest(high, 9)
+    _rsv = (_h9 - _l9) == 0 ? 50.0 : (close - _l9) / (_h9 - _l9) * 100.0
+    var float _k = 50.0
+    var float _d = 50.0
+    _k := (2.0 / 3.0) * nz(_k[1], 50.0) + (1.0 / 3.0) * _rsv
+    _d := (2.0 / 3.0) * nz(_d[1], 50.0) + (1.0 / 3.0) * _k
+    _j  = (3.0 * _k) - (2.0 * _d)
+    _jxu = ta.crossover(_j, _k)
+    _jxd = ta.crossunder(_j, _k)
+
+    _vma  = ta.sma(volume, 20)
+    _vspk = volume / nz(_vma, 1.0)
+    _vawk = ta.highest(_vspk, 10) >= 1.6
+    _rng  = math.max(high - low, syminfo.mintick)
+    _lwick = (close - low) / _rng
+    _uwick = (high - close) / _rng
+    _sbl  = _uwick / math.max(_lwick, 0.15)
+    _sbs  = _lwick / math.max(_uwick, 0.15)
+
+    _tdir = (close > _ema99 and _ema21 > _ema99 and close > _ema200) ? 1 : (close < _ema99 and _ema21 < _ema99 and close < _ema200) ? -1 : 0
+    _bull = (close > _ema99) and (_ema21 > _ema99) and (not use_mtf_trend or close > _ema200) and (_adx >= 16.0)
+    _bear = (close < _ema99) and (_ema21 < _ema99) and (not use_mtf_trend or close < _ema200) and (_adx >= 16.0)
+
+    _abs_l = _bull and _vawk and (low <= _ema21 * 1.005) and (close > open or _lwick >= 0.55) and (_sbl >= 1.5 or _sbl[1] >= 1.6) and (_j <= 30.0) and (_stoch_k <= 42.0)
+    _abs_s = _bear and _vawk and (high >= _ema21 * 0.995) and (close < open or _uwick >= 0.55) and (_sbs >= 1.5 or _sbs[1] >= 1.6) and (_j >= 70.0) and (_stoch_k >= 58.0)
+    _mom_l = _bull and (_vspk >= 1.6) and (close > open) and (_lwick > 0.60) and (_j >= 48.0 and _j <= 80.0) and _jxu and (_rsi >= 52 and _rsi <= 68) and (low <= _ema21 * 1.012)
+    _mom_s = _bear and (_vspk >= 1.6) and (close < open) and (_uwick > 0.60) and (_j <= 52.0 and _j >= 20.0) and _jxd and (_rsi <= 48 and _rsi >= 32) and (high >= _ema21 * 0.988)
+
+    var int _dir = 0
+    var float _ep = 0.0
+    var float _sl = 0.0
+    var float _tp1 = 0.0
+    var float _tp2 = 0.0
+    var bool _t1_ok = false
+    var int _w1 = 0
+    var int _w2 = 0
+    var int _ls = 0
+    var float _net_r = 0.0
+
+    if _dir == 1
+        if not _t1_ok
+            if low <= _sl
+                _ls += 1
+                _net_r -= 1.0
+                _dir := 0
+            else if high >= _tp1
+                _t1_ok := true
+                _w1 += 1
+                if high >= _tp2
+                    _w2 += 1
+                    _net_r += full_win_r
+                    _dir := 0
+        else
+            if high >= _tp2
+                _w2 += 1
+                _net_r += full_win_r
+                _dir := 0
+            else if low <= _ep
+                _net_r += half_win_r
+                _dir := 0
+    else if _dir == -1
+        if not _t1_ok
+            if high >= _sl
+                _ls += 1
+                _net_r -= 1.0
+                _dir := 0
+            else if low <= _tp1
+                _t1_ok := true
+                _w1 += 1
+                if low <= _tp2
+                    _w2 += 1
+                    _net_r += full_win_r
+                    _dir := 0
+        else
+            if low <= _tp2
+                _w2 += 1
+                _net_r += full_win_r
+                _dir := 0
+            else if high >= _ep
+                _net_r += half_win_r
+                _dir := 0
+
+    _nl = (_dir == 0) and _in_date and (_abs_l or _mom_l)
+    _ns = (_dir == 0) and _in_date and (_abs_s or _mom_s) and not _nl
+    if _nl or _ns
+        _dir   := _nl ? 1 : -1
+        _ep    := close
+        _r     = _atr * sl_atr_mult
+        _sl    := _nl ? (close - _r) : (close + _r)
+        _tp1   := _nl ? (close + _r * tp1_rr) : (close - _r * tp1_rr)
+        _tp2   := _nl ? (close + _r * tp2_rr) : (close - _r * tp2_rr)
+        _t1_ok := false
+
+    _tot = _w1 + _ls
+    _wr1 = _tot > 0 ? (float(_w1) / float(_tot)) * 100.0 : 0.0
+    _wr2 = _tot > 0 ? (float(_w2) / float(_tot)) * 100.0 : 0.0
+    [_tot, _wr1, _wr2, _net_r, _tdir]
+
+[cnt_5m,  wr1_5m,  wr2_5m,  r_5m,  td_5m]  = request.security(syminfo.tickerid, "5",   f_calc_tf_stats(), ignore_invalid_symbol=true)
+[cnt_15m, wr1_15m, wr2_15m, r_15m, td_15m] = request.security(syminfo.tickerid, "15",  f_calc_tf_stats(), ignore_invalid_symbol=true)
+[cnt_1h,  wr1_1h,  wr2_1h,  r_1h,  td_1h]  = request.security(syminfo.tickerid, "60",  f_calc_tf_stats(), ignore_invalid_symbol=true)
+[cnt_4h,  wr1_4h,  wr2_4h,  r_4h,  td_4h]  = request.security(syminfo.tickerid, "240", f_calc_tf_stats(), ignore_invalid_symbol=true)
+
+// ============================================================
+//  GRAFİK ZAMAN DİLİMİ HESAPLARI
+// ============================================================
+ema21  = ta.ema(close, 21)
+ema99  = ta.ema(close, 99)
+ema200 = ta.ema(close, 200)
+atr    = ta.atr(14)
+
+[diPlus, diMinus, adx] = ta.dmi(14, 14)
+
+rsi = ta.rsi(close, 14)
+rsi_min_val = ta.lowest(rsi, 14)
+rsi_max_val = ta.highest(rsi, 14)
+stoch_rsi = (rsi_max_val - rsi_min_val) == 0 ? 50.0 : (rsi - rsi_min_val) / (rsi_max_val - rsi_min_val) * 100.0
+stoch_k = ta.sma(stoch_rsi, 3)
+
+low_9  = ta.lowest(low, 9)
+high_9 = ta.highest(high, 9)
+rsv    = (high_9 - low_9) == 0 ? 50.0 : (close - low_9) / (high_9 - low_9) * 100.0
+
+var float k_val = 50.0
+var float d_val = 50.0
+k_val := (2.0 / 3.0) * nz(k_val[1], 50.0) + (1.0 / 3.0) * rsv
+d_val := (2.0 / 3.0) * nz(d_val[1], 50.0) + (1.0 / 3.0) * k_val
+kdj_j = (3.0 * k_val) - (2.0 * d_val)
+j_cross_up = ta.crossover(kdj_j, k_val)
+j_cross_dn = ta.crossunder(kdj_j, k_val)
+
+vol_ma20 = ta.sma(volume, 20)
+vol_spike = volume / nz(vol_ma20, 1.0)
+recent_vol_awake = ta.highest(vol_spike, 10) >= 1.6
+
+candle_range = math.max(high - low, syminfo.mintick)
+lower_wick_power = (close - low) / candle_range
+upper_wick_power = (high - close) / candle_range
+
+sb_ratio_long_abs  = upper_wick_power / math.max(lower_wick_power, 0.15)
+sb_ratio_short_abs = lower_wick_power / math.max(upper_wick_power, 0.15)
+
+// ------------------------------------------------------------
+//  FVG
+// ------------------------------------------------------------
+is_bull_fvg = (low > high[2]) and (close[1] > open[1]) and ((low - high[2]) > atr * 0.18)
+is_bear_fvg = (high < low[2]) and (close[1] < open[1]) and ((low[2] - high) > atr * 0.18)
+
+if show_fvg and is_bull_fvg and in_date_range
+    box.new(bar_index - 2, low, bar_index + 6, high[2], bgcolor=color.new(color.teal, 85), border_color=color.new(color.teal, 50), text="FVG Al", text_color=color.white, text_size=size.tiny)
+
+if show_fvg and is_bear_fvg and in_date_range
+    box.new(bar_index - 2, low[2], bar_index + 6, high, bgcolor=color.new(color.maroon, 85), border_color=color.new(color.red, 50), text="FVG Sat", text_color=color.white, text_size=size.tiny)
+
+// ------------------------------------------------------------
+//  LİKİDİTE (BSL / SSL)
+// ------------------------------------------------------------
+ph = ta.pivothigh(high, liq_pivot_len, liq_pivot_len)
+pl = ta.pivotlow(low, liq_pivot_len, liq_pivot_len)
+
+var line bsl_line = na
+var line ssl_line = na
+var float active_bsl = na
+var float active_ssl = na
+
+if not na(ph)
+    active_bsl := ph
+    if show_liq
+        line.delete(bsl_line)
+        bsl_line := line.new(bar_index - liq_pivot_len, active_bsl, bar_index, active_bsl, color=color.orange, width=1, style=line.style_dotted)
+
+if not na(pl)
+    active_ssl := pl
+    if show_liq
+        line.delete(ssl_line)
+        ssl_line := line.new(bar_index - liq_pivot_len, active_ssl, bar_index, active_ssl, color=color.aqua, width=1, style=line.style_dotted)
+
+bool bull_liq_sweep = false
+bool bear_liq_sweep = false
+
+if not na(active_ssl)
+    if show_liq and not na(ssl_line)
+        line.set_x2(ssl_line, bar_index)
+    if low < active_ssl and close > active_ssl
+        bull_liq_sweep := true
+        active_ssl := na
+    else if close < active_ssl
+        active_ssl := na
+
+if not na(active_bsl)
+    if show_liq and not na(bsl_line)
+        line.set_x2(bsl_line, bar_index)
+    if high > active_bsl and close < active_bsl
+        bear_liq_sweep := true
+        active_bsl := na
+    else if close > active_bsl
+        active_bsl := na
+
+smc_bull_ok = bull_liq_sweep or bull_liq_sweep[1]
+smc_bear_ok = bear_liq_sweep or bear_liq_sweep[1]
+
+// ------------------------------------------------------------
+//  TREND & SİNYALLER
+// ------------------------------------------------------------
+trend_dir_now = (close > ema99 and ema21 > ema99 and close > ema200) ? 1 : (close < ema99 and ema21 < ema99 and close < ema200) ? -1 : 0
+
+trend_ok_l = (close > ema99) and (ema21 > ema99) and (not use_mtf_trend or close > ema200) and (adx >= 16.0)
+trend_ok_s = (close < ema99) and (ema21 < ema99) and (not use_mtf_trend or close < ema200) and (adx >= 16.0)
+
+abs_long  = trend_ok_l and recent_vol_awake and ((low <= ema21 * 1.005) or smc_bull_ok) and (sb_ratio_long_abs >= 1.5) and (kdj_j <= 30.0) and (stoch_k <= 42.0)
+abs_short = trend_ok_s and recent_vol_awake and ((high >= ema21 * 0.995) or smc_bear_ok) and (sb_ratio_short_abs >= 1.5) and (kdj_j >= 70.0) and (stoch_k >= 58.0)
+
+mom_long  = trend_ok_l and (vol_spike >= 1.6) and (close > open) and (lower_wick_power > 0.60) and (kdj_j >= 48.0 and kdj_j <= 80.0) and j_cross_up and (rsi >= 52 and rsi <= 68)
+mom_short = trend_ok_s and (vol_spike >= 1.6) and (close < open) and (upper_wick_power > 0.60) and (kdj_j <= 52.0 and kdj_j >= 20.0) and j_cross_dn and (rsi <= 48 and rsi >= 32)
+
+raw_long  = abs_long or mom_long
+raw_short = abs_short or mom_short
+
+// ------------------------------------------------------------
+//  İSTATİSTİK SAYAÇLARI
+// ------------------------------------------------------------
+var int total_signals   = 0
+var int tp1_only_wins   = 0
+var int tp2_full_wins   = 0
+var int sl_losses       = 0
+var int long_tp1_w      = 0
+var int long_tp2_w      = 0
+var int long_sl_l       = 0
+var int short_tp1_w     = 0
+var int short_tp2_w     = 0
+var int short_sl_l      = 0
+var float total_net_r   = 0.0
+var float long_net_r    = 0.0
+var float short_net_r   = 0.0
+var float peak_r        = 0.0
+var float max_dd_r      = 0.0
+var int cur_loss_streak = 0
+var int max_loss_streak = 0
+var int last_signal_bar = na
+var int last_signal_dir = 0
+
+var int active_dir    = 0
+var float entry_p     = 0.0
+var float sl_p        = 0.0
+var float tp1_p       = 0.0
+var float tp2_p       = 0.0
+var float risk_p      = 0.0
+var bool tp1_hit      = false
+
+var line l_ent = na
+var line l_sl  = na
+var line l_tp1 = na
+var line l_tp2 = na
+
+// ------------------------------------------------------------
+//  AÇIK POZİSYON TAKİBİ
+// ------------------------------------------------------------
+if active_dir == 1
+    line.set_x2(l_ent, bar_index)
+    line.set_x2(l_sl, bar_index)
+    line.set_x2(l_tp1, bar_index)
+    line.set_x2(l_tp2, bar_index)
+
+    if not tp1_hit
+        if low <= sl_p
+            sl_losses       += 1
+            long_sl_l       += 1
+            total_net_r     -= 1.0
+            long_net_r      -= 1.0
+            cur_loss_streak += 1
+            max_loss_streak := math.max(max_loss_streak, cur_loss_streak)
+            active_dir      := 0
+        else if high >= tp1_p
+            tp1_hit         := true
+            long_tp1_w      += 1
+            cur_loss_streak := 0
+            if high >= tp2_p
+                tp2_full_wins += 1
+                long_tp2_w    += 1
+                total_net_r   += full_win_r
+                long_net_r    += full_win_r
+                active_dir    := 0
+    else
+        if high >= tp2_p
+            tp2_full_wins += 1
+            long_tp2_w    += 1
+            total_net_r   += full_win_r
+            long_net_r    += full_win_r
+            active_dir    := 0
+        else if low <= entry_p
+            tp1_only_wins += 1
+            total_net_r   += half_win_r
+            long_net_r    += half_win_r
+            active_dir    := 0
+
+else if active_dir == -1
+    line.set_x2(l_ent, bar_index)
+    line.set_x2(l_sl, bar_index)
+    line.set_x2(l_tp1, bar_index)
+    line.set_x2(l_tp2, bar_index)
+
+    if not tp1_hit
+        if high >= sl_p
+            sl_losses       += 1
+            short_sl_l      += 1
+            total_net_r     -= 1.0
+            short_net_r     -= 1.0
+            cur_loss_streak += 1
+            max_loss_streak := math.max(max_loss_streak, cur_loss_streak)
+            active_dir      := 0
+        else if low <= tp1_p
+            tp1_hit         := true
+            short_tp1_w     += 1
+            cur_loss_streak := 0
+            if low <= tp2_p
+                tp2_full_wins += 1
+                short_tp2_w   += 1
+                total_net_r   += full_win_r
+                short_net_r   += full_win_r
+                active_dir    := 0
+    else
+        if low <= tp2_p
+            tp2_full_wins += 1
+            short_tp2_w   += 1
+            total_net_r   += full_win_r
+            short_net_r   += full_win_r
+            active_dir    := 0
+        else if high >= entry_p
+            tp1_only_wins += 1
+            total_net_r   += half_win_r
+            short_net_r   += half_win_r
+            active_dir    := 0
+
+// Maksimum düşüş (R bazında, kapanan işlemler üzerinden)
+peak_r   := math.max(peak_r, total_net_r)
+max_dd_r := math.max(max_dd_r, peak_r - total_net_r)
+
+// ------------------------------------------------------------
+//  YENİ SİNYAL
+// ------------------------------------------------------------
+l_closed  = long_tp1_w + long_sl_l
+s_closed  = short_tp1_w + short_sl_l
+l_tp1_rat = l_closed >= 3 ? (float(long_tp1_w) / float(l_closed)) * 100.0 : 55.0
+s_tp1_rat = s_closed >= 3 ? (float(short_tp1_w) / float(s_closed)) * 100.0 : 55.0
+
+prob_tp1_l = math.min(math.max(0.50 * l_tp1_rat + 25.0, 20.0), 92.0)
+prob_tp1_s = math.min(math.max(0.50 * s_tp1_rat + 25.0, 20.0), 92.0)
+
+new_long  = (active_dir == 0) and in_date_range and raw_long and (prob_tp1_l >= min_prob_filt)
+new_short = (active_dir == 0) and in_date_range and raw_short and not new_long and (prob_tp1_s >= min_prob_filt)
+
+if new_long
+    line.delete(l_ent)
+    line.delete(l_sl)
+    line.delete(l_tp1)
+    line.delete(l_tp2)
+
+    total_signals   += 1
+    active_dir      := 1
+    entry_p         := close
+    risk_p          := atr * sl_atr_mult
+    sl_p            := close - risk_p
+    tp1_p           := close + (risk_p * tp1_rr)
+    tp2_p           := close + (risk_p * tp2_rr)
+    tp1_hit         := false
+    last_signal_bar := bar_index
+    last_signal_dir := 1
+
+    label.new(bar_index, low, "🚀 LONG | TP1: %" + str.tostring(prob_tp1_l, "#"), color=color.green, textcolor=color.white, style=label.style_label_up, size=size.small)
+    l_ent  := line.new(bar_index, entry_p, bar_index + 5, entry_p, color=color.yellow, width=2)
+    l_sl   := line.new(bar_index, sl_p, bar_index + 5, sl_p, color=color.red, width=2)
+    l_tp1  := line.new(bar_index, tp1_p, bar_index + 5, tp1_p, color=color.teal, width=1, style=line.style_dashed)
+    l_tp2  := line.new(bar_index, tp2_p, bar_index + 5, tp2_p, color=color.lime, width=2)
+
+if new_short
+    line.delete(l_ent)
+    line.delete(l_sl)
+    line.delete(l_tp1)
+    line.delete(l_tp2)
+
+    total_signals   += 1
+    active_dir      := -1
+    entry_p         := close
+    risk_p          := atr * sl_atr_mult
+    sl_p            := close + risk_p
+    tp1_p           := close - (risk_p * tp1_rr)
+    tp2_p           := close - (risk_p * tp2_rr)
+    tp1_hit         := false
+    last_signal_bar := bar_index
+    last_signal_dir := -1
+
+    label.new(bar_index, high, "🩸 SHORT | TP1: %" + str.tostring(prob_tp1_s, "#"), color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small)
+    l_ent  := line.new(bar_index, entry_p, bar_index + 5, entry_p, color=color.yellow, width=2)
+    l_sl   := line.new(bar_index, sl_p, bar_index + 5, sl_p, color=color.red, width=2)
+    l_tp1  := line.new(bar_index, tp1_p, bar_index + 5, tp1_p, color=color.teal, width=1, style=line.style_dashed)
+    l_tp2  := line.new(bar_index, tp2_p, bar_index + 5, tp2_p, color=color.lime, width=2)
+
+// ------------------------------------------------------------
+//  ÇİZİMLER & ALARMLAR
+// ------------------------------------------------------------
+plot(ema21, title="EMA 21", color=color.yellow, linewidth=2)
+plot(ema99, title="EMA 99", color=color.aqua, linewidth=2)
+plot(ema200, title="EMA 200", color=color.fuchsia, linewidth=2)
+bgcolor(new_long ? color.new(color.green, 82) : new_short ? color.new(color.red, 82) : na)
+
+alertcondition(new_long,  title="KM LONG Sinyali",  message="KM PRO V5: LONG sinyali - {{ticker}} {{interval}} @ {{close}}")
+alertcondition(new_short, title="KM SHORT Sinyali", message="KM PRO V5: SHORT sinyali - {{ticker}} {{interval}} @ {{close}}")
+
+// ============================================================
+//  PANEL
+// ============================================================
+panel_pos = panel_pos_in == "Sağ Üst" ? position.top_right : panel_pos_in == "Sağ Alt" ? position.bottom_right : panel_pos_in == "Sol Üst" ? position.top_left : position.bottom_left
+
+var table stat_tbl = show_panel ? table.new(panel_pos, columns=2, rows=22, bgcolor=color.new(color.black, 10), border_color=color.gray, border_width=1) : na
+
+c_head = color.navy
+c_sec  = color.new(color.teal, 55)
+c_lbl  = color.new(color.white, 15)
+
+if show_panel and barstate.islast
+    // ---- Genel performans ----
+    total_tp1_wins = tp1_only_wins + tp2_full_wins
+    closed_count   = total_tp1_wins + sl_losses
+    tp1_wr         = closed_count > 0 ? (float(total_tp1_wins) / float(closed_count)) * 100.0 : 0.0
+    tp2_wr         = closed_count > 0 ? (float(tp2_full_wins) / float(closed_count)) * 100.0 : 0.0
+    avg_r          = closed_count > 0 ? total_net_r / float(closed_count) : 0.0
+    gross_loss_r   = float(sl_losses)
+    gross_win_r    = total_net_r + gross_loss_r
+    pf_txt         = gross_loss_r > 0 ? str.tostring(gross_win_r / gross_loss_r, "0.00") : (gross_win_r > 0 ? "∞" : "—")
+    pf_col         = gross_loss_r > 0 ? (gross_win_r / gross_loss_r >= 1.5 ? color.lime : gross_win_r / gross_loss_r >= 1.0 ? color.yellow : color.red) : color.gray
+
+    l_wr = l_closed > 0 ? (float(long_tp1_w) / float(l_closed)) * 100.0 : 0.0
+    s_wr = s_closed > 0 ? (float(short_tp1_w) / float(s_closed)) * 100.0 : 0.0
+
+    // ---- Anlık piyasa durumu ----
+    adx_txt   = adx >= 25.0 ? "Güçlü" : adx >= 16.0 ? "Orta" : "Zayıf"
+    trend_txt = trend_dir_now == 1 ? "YÜKSELİŞ" : trend_dir_now == -1 ? "DÜŞÜŞ" : "KARIŞIK / YATAY"
+    trend_col = f_dir_col(trend_dir_now)
+    htf_txt   = "1S: " + f_dir_txt(td_1h) + "   4S: " + f_dir_txt(td_4h)
+    htf_col   = (td_1h == 1 and td_4h == 1) ? color.lime : (td_1h == -1 and td_4h == -1) ? color.red : color.yellow
+
+    string act_txt = "Yok"
+    color  act_col = color.gray
+    if active_dir != 0
+        unreal_r = active_dir == 1 ? (close - entry_p) / risk_p : (entry_p - close) / risk_p
+        act_txt := (active_dir == 1 ? "LONG" : "SHORT") + " @ " + str.tostring(entry_p, format.mintick) + " · " + f_r_txt(unreal_r) + (tp1_hit ? " · TP1 ✔ (BE)" : "")
+        act_col := unreal_r >= 0 ? color.lime : color.red
+
+    last_sig_txt = na(last_signal_bar) ? "—" : str.tostring(bar_index - last_signal_bar) + " bar önce (" + (last_signal_dir == 1 ? "LONG" : "SHORT") + ")"
+
+    // ---- En iyi periyot (NET R bazında) ----
+    string best_tf_str = ""
+    float  best_tf_r   = -1.0e9
+    bool   best_found  = false
+    if cnt_5m >= min_tf_trades and r_5m > best_tf_r
+        best_tf_str := "5 DAKİKA"
+        best_tf_r   := r_5m
+        best_found  := true
+    if cnt_15m >= min_tf_trades and r_15m > best_tf_r
+        best_tf_str := "15 DAKİKA"
+        best_tf_r   := r_15m
+        best_found  := true
+    if cnt_1h >= min_tf_trades and r_1h > best_tf_r
+        best_tf_str := "1 SAAT"
+        best_tf_r   := r_1h
+        best_found  := true
+    if cnt_4h >= min_tf_trades and r_4h > best_tf_r
+        best_tf_str := "4 SAAT"
+        best_tf_r   := r_4h
+        best_found  := true
+    best_txt = not best_found ? "YETERSİZ VERİ (min " + str.tostring(min_tf_trades) + " işl.)" : best_tf_r > 0 ? "🔥 " + best_tf_str + " (" + f_r_txt(best_tf_r) + ")" : "⚠ " + best_tf_str + " (" + f_r_txt(best_tf_r) + ") · hepsi zararda"
+    best_col = not best_found ? color.gray : best_tf_r > 0 ? color.yellow : color.orange
+
+    wr1_col = tp1_wr >= 55.0 ? color.lime : tp1_wr >= 45.0 ? color.yellow : color.red
+
+    // ---- Başlık ----
+    table.cell(stat_tbl, 0, 0, "KM PRO V5 · SON " + str.tostring(lookback_days) + " GÜN", text_color=color.white, text_size=size.small, bgcolor=c_head, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 0, syminfo.ticker + " · " + timeframe.period, text_color=color.yellow, text_size=size.small, bgcolor=c_head)
+
+    // ---- Piyasa durumu ----
+    table.cell(stat_tbl, 0, 1, "📈 Anlık Trend (" + timeframe.period + ")", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 1, trend_txt + " · ADX " + str.tostring(adx, "0") + " (" + adx_txt + ")", text_color=trend_col, text_size=size.small)
+
+    table.cell(stat_tbl, 0, 2, "🧭 Üst Zaman Trendi", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 2, htf_txt, text_color=htf_col, text_size=size.tiny)
+
+    table.cell(stat_tbl, 0, 3, "📊 RSI / StochK / KDJ-J", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 3, str.tostring(rsi, "0") + " / " + str.tostring(stoch_k, "0") + " / " + str.tostring(kdj_j, "0"), text_color=color.white, text_size=size.tiny)
+
+    table.cell(stat_tbl, 0, 4, "📌 Aktif İşlem", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 4, act_txt, text_color=act_col, text_size=size.tiny)
+
+    table.cell(stat_tbl, 0, 5, "🕒 Son Sinyal", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 5, last_sig_txt, text_color=color.white, text_size=size.tiny)
+
+    // ---- Performans ----
+    table.cell(stat_tbl, 0, 6, "PERFORMANS (" + timeframe.period + " grafik)", text_color=color.white, text_size=size.tiny, bgcolor=c_sec, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 6, "", bgcolor=c_sec)
+
+    table.cell(stat_tbl, 0, 7, "✔ TP1 Vurma Oranı", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 7, "%" + str.tostring(tp1_wr, "0.0") + " (" + str.tostring(total_tp1_wins) + "W / " + str.tostring(sl_losses) + "L)", text_color=wr1_col, text_size=size.small)
+
+    table.cell(stat_tbl, 0, 8, "🎯 TP2 Tam Hedef", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 8, "%" + str.tostring(tp2_wr, "0.0") + " (" + str.tostring(tp2_full_wins) + " işl.)", text_color=color.aqua, text_size=size.tiny)
+
+    table.cell(stat_tbl, 0, 9, "💰 Net Kazanç", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 9, f_r_txt(total_net_r) + " (" + str.tostring(closed_count) + " kapanan)", text_color=f_r_col(total_net_r), text_size=size.small)
+
+    table.cell(stat_tbl, 0, 10, "📐 Ortalama R / İşlem", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 10, (avg_r >= 0 ? "+" : "") + str.tostring(avg_r, "0.00") + " R", text_color=f_r_col(avg_r), text_size=size.tiny)
+
+    table.cell(stat_tbl, 0, 11, "⚖ Kâr Faktörü", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 11, pf_txt, text_color=pf_col, text_size=size.tiny)
+
+    table.cell(stat_tbl, 0, 12, "📉 Maks. Düşüş", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 12, (max_dd_r > 0 ? "-" : "") + str.tostring(max_dd_r, "0.0") + " R", text_color=max_dd_r >= 5.0 ? color.red : max_dd_r >= 3.0 ? color.yellow : color.white, text_size=size.tiny)
+
+    table.cell(stat_tbl, 0, 13, "🔻 Maks. Ardışık Kayıp", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 13, str.tostring(max_loss_streak) + " işlem", text_color=max_loss_streak >= 5 ? color.red : max_loss_streak >= 3 ? color.yellow : color.white, text_size=size.tiny)
+
+    table.cell(stat_tbl, 0, 14, "🟢 LONG", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 14, l_closed > 0 ? f_r_txt(long_net_r) + " · %" + str.tostring(l_wr, "0") + " TP1 (" + str.tostring(long_tp1_w) + "W/" + str.tostring(long_sl_l) + "L)" : "İşlem yok", text_color=l_closed > 0 ? f_r_col(long_net_r) : color.gray, text_size=size.tiny)
+
+    table.cell(stat_tbl, 0, 15, "🔴 SHORT", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 15, s_closed > 0 ? f_r_txt(short_net_r) + " · %" + str.tostring(s_wr, "0") + " TP1 (" + str.tostring(short_tp1_w) + "W/" + str.tostring(short_sl_l) + "L)" : "İşlem yok", text_color=s_closed > 0 ? f_r_col(short_net_r) : color.gray, text_size=size.tiny)
+
+    // ---- Zaman dilimi karşılaştırması ----
+    table.cell(stat_tbl, 0, 16, "ZAMAN DİLİMİ KARŞILAŞTIRMASI (NET R)", text_color=color.white, text_size=size.tiny, bgcolor=c_sec, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 16, "", bgcolor=c_sec)
+
+    table.cell(stat_tbl, 0, 17, "⏱ 5 Dakika", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 17, f_tf_row(r_5m, wr1_5m, cnt_5m), text_color=cnt_5m > 0 ? f_r_col(r_5m) : color.gray, text_size=size.tiny)
+
+    table.cell(stat_tbl, 0, 18, "⏱ 15 Dakika", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 18, f_tf_row(r_15m, wr1_15m, cnt_15m), text_color=cnt_15m > 0 ? f_r_col(r_15m) : color.gray, text_size=size.tiny)
+
+    table.cell(stat_tbl, 0, 19, "⏱ 1 Saat", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 19, f_tf_row(r_1h, wr1_1h, cnt_1h), text_color=cnt_1h > 0 ? f_r_col(r_1h) : color.gray, text_size=size.tiny)
+
+    table.cell(stat_tbl, 0, 20, "⏱ 4 Saat", text_color=c_lbl, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 20, f_tf_row(r_4h, wr1_4h, cnt_4h), text_color=cnt_4h > 0 ? f_r_col(r_4h) : color.gray, text_size=size.tiny)
+
+    table.cell(stat_tbl, 0, 21, "💡 EN İYİ PERİYOT (R)", text_color=color.yellow, text_size=size.tiny, bgcolor=color.new(color.teal, 40), text_halign=text.align_left)
+    table.cell(stat_tbl, 1, 21, best_txt, text_color=best_col, text_size=size.small, bgcolor=color.new(color.teal, 40))
