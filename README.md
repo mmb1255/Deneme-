@@ -64,3 +64,39 @@ Bar içinde tam olarak hangi dakikada vurulduğu bilinemez; hassasiyet grafik pe
    `https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<CHAT_ID>&text=test`
 
 Chat ID boşsa mesajlar düz metin üretilir; bu durumda uygulama bildirimi ve e-posta için kullanılabilir.
+
+## Tarayıcı bot (bot/km_scanner.py)
+
+TradingView'dan bağımsız çalışan Python botu. Binance USDT-M vadeli coinlerini
+hacme göre sıralar, her coin için indikatördeki zaman dilimi backtest mantığını
+birebir uygular ve eşiği geçenleri Telegram'a yazar. **Webhook ve ücretli
+TradingView planı gerekmez.**
+
+Varsayılan eşik: net R ≥ +10, TP1 oranı ≥ %50, en az 5 işlem, son 30 gün, 15m ve 1h.
+
+Gönderdikleri:
+- Eşiği geçen coin listesi (net R, TP1 %, işlem sayısı, LONG/SHORT R, maks. düşüş, açık işlem varsa). Liste değişince gönderilir; `--always-summary` ile her taramada.
+- Eşiği geçen bir coinde son kapanan barda yeni LONG/SHORT açıldıysa giriş, SL, TP1, TP2 ve geçmiş istatistikle sinyal mesajı. Aynı sinyal iki kez gönderilmez.
+
+### Kurulum (bilgisayar ya da ucuz bir VPS)
+
+```bash
+cd bot
+pip install -r requirements.txt
+export TG_BOT_TOKEN="BotFather'dan aldığın token"   # Windows: set TG_BOT_TOKEN=...
+export TG_CHAT_ID="1056156546"
+python km_scanner.py --selftest                    # mantık testi, internet gerekmez
+python km_scanner.py --once --dry-run --top 20     # 20 coin tara, Telegram'a göndermeden ekrana yaz
+python km_scanner.py --once                        # tek tarama, Telegram'a gönder
+python km_scanner.py                               # sürekli çalış, 15 dk'da bir tara
+```
+
+Sık kullanılan seçenekler: `--tfs 5m,15m,1h,4h`, `--days 30`, `--min-r 10`, `--min-tp1 50`,
+`--min-trades 5`, `--top 150`, `--symbols BTCUSDT,ETHUSDT`, `--interval 15`.
+
+Notlar:
+- Botun çalışması için bilgisayar açık kalmalı; sürekli bildirim istiyorsan aylık birkaç dolara bir VPS'e kur.
+- Önce Telegram'da botuna **Start** yazmalısın, yoksa bot sana mesaj atamaz.
+- 150 coin × 2 periyot bir tarama yaklaşık 2-3 dakika sürer (Binance istek sınırına uyar).
+- Bot, indikatörün "zaman dilimi satırı" mantığını kullanır (likidite süpürme ve TP1 şans filtresi yok). PERFORMANS bloğuyla değil, panelin alt kısmındaki periyot satırlarıyla karşılaştır.
+- Pine ve Python göstergeleri aynı formülle yazıldı ama ufak yuvarlama farkları olabilir; birebir aynı sayıyı beklemeden önce birkaç coinde karşılaştır.
